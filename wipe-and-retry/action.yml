@@ -1,0 +1,79 @@
+name: Wipe and Retry Checkout
+description: |
+  Wipe ${GITHUB_WORKSPACE} and re-run `actions/checkout` to recover from a
+  poisoned `.git`. Use as a follow-up to a checkout step that has
+  `continue-on-error: true`, gated on `steps.<id>.outcome == 'failure'`.
+
+  Self-hosted runners reuse one `.git` across jobs, and `git lfs fetch`
+  reads every blob in the tree to tell pointers from ordinary files, so any
+  blob it cannot resolve aborts the checkout with "Could not scan for Git
+  LFS files". Two states cause that: a workspace cloned with
+  `--filter=blob:none`, whose blobs were never fetched at all; or `git gc`
+  pruning a blob a newly-pushed ref references. A fresh clone is neither
+  partial nor pruned, so wiping recovers from both within the same run.
+
+  Forward the SAME inputs the guarded checkout uses. In particular a step
+  whose job later pushes needs `persist-credentials: true` and its `token`,
+  and a sparse checkout must stay sparse — a full re-clone in a shared
+  workspace leaves LFS files as pointer stubs for whatever runs next.
+
+  Reference this by full repo path, pinned by SHA — e.g.
+  `lakecoloring/ci-actions/wipe-and-retry@<sha> # v1`, NOT `./`.
+  The LFS-fetch failure aborts during fetch, before `git checkout` writes
+  the working tree, so a local `./` reference can't be loaded — its source
+  isn't on disk. A full-path reference is fetched into the runner's
+  `_actions/` dir server-side, independent of ${GITHUB_WORKSPACE}, so it
+  survives the wipe. The inner `actions/checkout` is likewise a remote
+  action loaded by SHA — neither step needs local source.
+
+inputs:
+  fetch-depth:
+    description: Forwarded to actions/checkout.
+    required: false
+    default: '1'
+  lfs:
+    description: Forwarded to actions/checkout.
+    required: false
+    default: 'true'
+  token:
+    description: Forwarded to actions/checkout.
+    required: false
+    default: ${{ github.token }}
+  persist-credentials:
+    description: |
+      Forwarded to actions/checkout. Pass true wherever a later step pushes,
+      so the retry keeps the push rights the first checkout had.
+    required: false
+    default: 'false'
+  sparse-checkout:
+    description: |
+      Forwarded to actions/checkout. Pass the same paths the guarded checkout
+      used; an empty value checks out the whole tree.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # Resolve and sanity-check before the destructive rm -rf so a
+        # mis-set GITHUB_WORKSPACE can't wipe `/` or any other path that
+        # isn't a GitHub Actions runner workspace (which always sit under
+        # a `_work/` segment).
+        ws="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is unset}"
+        ws_real="$(cd "$ws" 2>/dev/null && pwd -P || true)"
+        if [[ -z "$ws_real" || "$ws_real" = "/" || "$ws_real" != */_work/* ]]; then
+          echo "::error::Refusing to wipe '$ws_real' — not a runner workspace path."
+          exit 1
+        fi
+        echo "::warning::Checkout failed; wiping $ws_real before retry."
+        cd / && rm -rf "$ws_real" && mkdir -p "$ws_real"
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        fetch-depth: ${{ inputs.fetch-depth }}
+        lfs: ${{ inputs.lfs }}
+        token: ${{ inputs.token }}
+        persist-credentials: ${{ inputs.persist-credentials }}
+        sparse-checkout: ${{ inputs.sparse-checkout }}
